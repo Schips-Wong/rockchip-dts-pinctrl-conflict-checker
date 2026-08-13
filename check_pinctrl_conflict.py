@@ -76,9 +76,31 @@ class NodeUsage:
         return f"NodeUsage({self.node_path}, pinctrl-{self.pinctrl_index}, refs={self.refs})"
 
 
+class GpioUsage:
+    """一个设备节点通过 *-gpios / gpio 属性直接引用的 GPIO pin"""
+    def __init__(self, node_path, prop_name, filepath, lineno):
+        self.node_path = node_path
+        self.prop_name = prop_name      # 属性名, 如 "enable-gpios" / "reset-gpios" / "gpio"
+        self.filepath = filepath
+        self.lineno = lineno
+        self.pins = []                  # (bank, pin) 列表, 每个元素为 (bank, pin)
+
+    def __repr__(self):
+        return f"GpioUsage({self.node_path}, {self.prop_name}, pins={self.pins})"
+
+
 # ============================================================
 # RK3588 pin 命名解析 (bank, pin)
 # ============================================================
+
+# Rockchip 平台: RK_FUNC_GPIO 宏表示 func=0 (GPIO 功能, 不做外设复用)
+RK_FUNC_GPIO = 0
+
+# 可识别的 GPIO 控制器引用名 → bank 编号 (rk3588: gpio0~gpio4 对应 bank 0~4)
+GPIO_BANK_MAP = {}
+for _b in range(0, 8):
+    GPIO_BANK_MAP[f'gpio{_b}'] = _b
+
 
 def rk_pin_to_number(pin_name):
     """将 RK_Pxx 转为数值: RK_PA0→0, RK_PB2→10, RK_PD5→29 等"""
@@ -101,9 +123,11 @@ class DtsFile:
     """代表一个 dts/dtsi 文件"""
     def __init__(self, filepath):
         self.filepath = os.path.abspath(filepath)
-        self.includes = []
+        self.includes = []          # [(lineno, inc_path), ...] 保持出现顺序
         self.pinctrl_nodes = {}     # label → PinctrlNode
         self.node_usages = []       # NodeUsage 列表
+        self.gpio_usages = []       # GpioUsage 列表
+        self.node_status = {}       # node_path → status 字符串 ("okay"/"disabled"/...)
 
     def parse(self):
         base_dir = os.path.dirname(self.filepath)
@@ -124,13 +148,13 @@ class DtsFile:
             line = re.sub(r'//.*', '', line)
             cleaned_lines.append(line)
 
-        # --- 第二步: 提取 #include ---
-        for line in cleaned_lines:
+        # --- 第二步: 提取 #include (记录行号, 用于精确模拟展开顺序) ---
+        for idx, line in enumerate(cleaned_lines):
             m = re.match(r'#include\s+[<"]([^>"]+\.dts[^>"]*)[>"]', line)
             if m:
                 inc_name = m.group(1)
                 inc_path = os.path.normpath(os.path.join(base_dir, inc_name))
-                self.includes.append(inc_path)
+                self.includes.append((idx + 1, inc_path))
 
         # --- 第三步: 解析节点结构 ---
         self._parse_nodes(cleaned_lines)
@@ -210,6 +234,14 @@ class DtsFile:
                             pending_lines = []
                 continue
 
+            # --- 任意节点内部: 收集 status 属性 ---
+            status_m = re.match(r'status\s*=\s*"([^"]+)"\s*;', stripped)
+            if status_m:
+                status_val = status_m.group(1)
+                node_path = '/'.join(node_stack) if node_stack else '/'
+                self.node_status[node_path] = (lineno, status_val)
+                continue
+
             # --- 任意节点内部: 收集 pinctrl-N 引用 (N = 0, 1, 2, ...) ---
             # 单行格式
             pinctrl_m = re.match(r'pinctrl-(\d+)\s*=\s*<(.+)>;', stripped)
@@ -242,6 +274,39 @@ class DtsFile:
                 self.node_usages.append(usage)
                 continue
 
+            # --- 任意节点内部: 收集 *-gpios / gpio 属性直接引用的 GPIO ---
+            # 属性名包含 gpio (enable-gpios / reset-gpios / irq-gpio / gpio / gpios / xxx,rst-gpio 等)
+            # 值格式: <&gpioX RK_PY flags> (可能多个, 逗号分隔, 可能跨行)
+            gpio_m = re.match(r'([\w\-]*(?:gpio|GPIO)[\w\-]*)\s*=\s*(.+)', stripped)
+            if gpio_m:
+                prop_name = gpio_m.group(1)
+                value_str = gpio_m.group(2).rstrip(';')
+
+                # 跨行续写: 若未闭合则继续拼接
+                if value_str.count('<') > value_str.count('>'):
+                    j = i + 1
+                    while j < len(lines):
+                        cont = lines[j].strip()
+                        value_str += ' ' + cont.rstrip(';')
+                        if value_str.count('<') <= value_str.count('>'):
+                            break
+                        j += 1
+
+                # 提取 <&gpioX RK_PY flags>
+                pins = []
+                for g in re.findall(r'&(gpio\d+)\s+(RK_P[A-D]\d+)', value_str):
+                    gbank = GPIO_BANK_MAP.get(g[0])
+                    gpin = rk_pin_to_number(g[1])
+                    if gbank is not None and gpin is not None:
+                        pins.append((gbank, gpin))
+
+                if pins:
+                    node_path = '/'.join(node_stack) if node_stack else '/'
+                    gpio_usage = GpioUsage(node_path, prop_name, self.filepath, lineno)
+                    gpio_usage.pins = pins
+                    self.gpio_usages.append(gpio_usage)
+                continue
+
     def _flush_pins(self, label, lineno, pin_lines):
         """解析缓存的 rockchip,pins 行"""
         if not label:
@@ -251,7 +316,7 @@ class DtsFile:
         combined = combined.rstrip(';')
 
         pin_entries = re.findall(
-            r'<\s*(\d+)\s+(RK_P[A-D]\d+)\s+(\d+)\s+(&?\w+)\s*>',
+            r'<\s*(\d+)\s+(RK_P[A-D]\d+)\s+([\w]+)\s+(&?\w+)\s*>',
             combined)
 
         node = self.pinctrl_nodes.get(label)
@@ -259,96 +324,233 @@ class DtsFile:
             node = PinctrlNode(label, self.filepath, lineno)
             self.pinctrl_nodes[label] = node
 
-        for bank_str, pin_name, func, bias in pin_entries:
+        for bank_str, pin_name, func_str, bias in pin_entries:
             bank = int(bank_str)
             pin_num = rk_pin_to_number(pin_name)
-            if pin_num is not None:
-                node.pins.append(PinEntry(bank, pin_num, int(func), bias, self.filepath, lineno))
+            if pin_num is None:
+                continue
+            # func 可能是数字, 也可能是 RK_FUNC_GPIO 等宏
+            if func_str == 'RK_FUNC_GPIO':
+                func = RK_FUNC_GPIO
+            else:
+                try:
+                    func = int(func_str)
+                except ValueError:
+                    func = func_str  # 无法识别的宏, 保留字符串
+            node.pins.append(PinEntry(bank, pin_num, func, bias, self.filepath, lineno))
 
 
 # ============================================================
 # 全局数据收集: 递归解析 #include 树
 # ============================================================
 
-def collect_all(entry_dts, visited=None):
+def collect_all(entry_dts):
     """
-    递归解析 #include 链，收集所有 pinctrl 定义和 pinctrl-N 引用。
+    递归解析 #include 链，收集 pinctrl 定义、pinctrl-N 引用、gpio 属性引用和节点状态。
 
     设备树覆盖语义:
-      - 同一节点路径、同一状态索引的 pinctrl-N: 后 include 的覆盖先 include 的
-      - 同一 label 的 pinctrl 节点定义: 后 include 的覆盖先 include 的
-      - 所以使用 dict 存储，后出现的自动覆盖先出现的
-    """
-    if visited is None:
-        visited = set()
+      设备树中 #include 把被包含文件的内容展开到 include 语句所在位置,
+      因此节点的有效定义取决于它们在"展开后"的先后顺序——后出现的覆盖先出现的。
+      用全局递增的顺序号 (order) 精确模拟这一顺序:
+        - 文件内按行号顺序, include 语句和被包含文件内容插入到 include 行位置,
+        - 同一 key 后出现的 (order 更大) 覆盖先出现的 (order 更小)。
 
+    返回: (all_pinctrl, all_usages, all_gpio_usages, all_node_status)
+    """
+    result = _collect_internal(entry_dts, set(), [0])
+    return result
+
+
+def _collect_internal(entry_dts, visited, order_counter):
+    """collect_all 的内部实现, 返回已剥掉 order 包装的结果。
+
+    返回值结构: (all_pinctrl, all_usages, all_gpio_usages, all_node_status)
+    其中 all_pinctrl: label → PinctrlNode
+         all_usages: (node_path, index) → (filepath, lineno, refs)
+         all_gpio_usages: (node_path, prop_name) → GpioUsage
+         all_node_status: node_path → status
+    """
     entry_path = os.path.abspath(entry_dts)
     if entry_path in visited:
-        return {}, {}
+        return {}, {}, {}, {}
     visited.add(entry_path)
 
     if not os.path.isfile(entry_path):
         print(f"[WARN] 文件不存在, 跳过: {entry_path}", file=sys.stderr)
-        return {}, {}
+        return {}, {}, {}, {}
 
     dts = DtsFile(entry_path)
     dts.parse()
 
-    # 当前文件的 pinctrl 定义: label → PinctrlNode
-    all_pinctrl = dict(dts.pinctrl_nodes)
-    # 当前文件的 pinctrl-N 引用: (node_path, index) → (filepath, lineno, refs)
-    all_usages = {}
+    # 结果字典: key → (order, value), order 用于覆盖优先级判断
+    all_pinctrl = {}        # label → (order, PinctrlNode)
+    all_usages = {}         # (node_path, index) → (order, (filepath, lineno, refs))
+    all_gpio_usages = {}    # (node_path, prop_name) → (order, GpioUsage)
+    all_node_status = {}    # node_path → (order, status)
+
+    def next_order():
+        order_counter[0] += 1
+        return order_counter[0]
+
+    def merge_into(target, incoming):
+        """将带 order 的 incoming 合并进 target (order 大者胜)"""
+        for k, (o, v) in incoming.items():
+            if k not in target or o > target[k][0]:
+                target[k] = (o, v)
+
+    # 按行号交错合并: 本文件自身的数据项 与 include 子文件内容
+    events = []
+
+    # include 事件
+    for inc_lineno, inc_path in dts.includes:
+        events.append((inc_lineno, 'include', inc_path))
+
+    # 本文件自身数据项事件
+    for label, pn in dts.pinctrl_nodes.items():
+        events.append((pn.lineno, 'pinctrl_def', label, pn))
     for u in dts.node_usages:
-        all_usages[(u.node_path, u.pinctrl_index)] = (u.filepath, u.lineno, u.refs)
+        events.append((u.lineno, 'pinctrl_use', u))
+    for g in dts.gpio_usages:
+        events.append((g.lineno, 'gpio_use', g))
+    for np, (s_lineno, s_val) in dts.node_status.items():
+        events.append((s_lineno, 'status', np, s_val))
 
-    for inc_path in dts.includes:
-        sub_pinctrl, sub_usages = collect_all(inc_path, visited)
-        # 合并: 后出现的覆盖先出现的 (设备树覆盖语义)
-        all_pinctrl.update(sub_pinctrl)
-        all_usages.update(sub_usages)
+    # 按行号排序
+    events.sort(key=lambda e: e[0])
 
-    return all_pinctrl, all_usages
+    for ev in events:
+        kind = ev[1]
+        if kind == 'include':
+            inc_path = ev[2]
+            sub_pinctrl, sub_usages, sub_gpio, sub_status = _collect_internal(
+                inc_path, visited, order_counter)
+            # 子文件结果已经是剥掉 order 的, 需要重新包装 order
+            # 但子文件内部已按顺序分配 order, 这里直接以它们的相对顺序重建 order
+            for k, v in sub_pinctrl.items():
+                all_pinctrl[k] = (next_order(), v)
+            for k, v in sub_usages.items():
+                all_usages[k] = (next_order(), v)
+            for k, v in sub_gpio.items():
+                all_gpio_usages[k] = (next_order(), v)
+            for k, v in sub_status.items():
+                all_node_status[k] = (next_order(), v)
+        elif kind == 'pinctrl_def':
+            label, pn = ev[2], ev[3]
+            all_pinctrl[label] = (next_order(), pn)
+        elif kind == 'pinctrl_use':
+            u = ev[2]
+            all_usages[(u.node_path, u.pinctrl_index)] = (
+                next_order(), (u.filepath, u.lineno, u.refs))
+        elif kind == 'gpio_use':
+            g = ev[2]
+            all_gpio_usages[(g.node_path, g.prop_name)] = (next_order(), g)
+        elif kind == 'status':
+            np, s_val = ev[2], ev[3]
+            all_node_status[np] = (next_order(), s_val)
+
+    # 剥掉 order 包装
+    final_pinctrl = {k: v for k, (o, v) in all_pinctrl.items()}
+    final_usages = {k: v for k, (o, v) in all_usages.items()}
+    final_gpio = {k: v for k, (o, v) in all_gpio_usages.items()}
+    final_status = {k: v for k, (o, v) in all_node_status.items()}
+
+    return final_pinctrl, final_usages, final_gpio, final_status
 
 
 # ============================================================
 # 冲突检测
 # ============================================================
 
-def find_conflicts(all_pinctrl, all_usages):
-    """检测 pinctrl-N 的 pin 冲突。
-    all_usages: dict[(node_path, pinctrl_index) → (filepath, lineno, refs)]
-    已经过设备树覆盖处理: 同一节点路径、同一状态索引只保留最后出现的引用。
+def find_conflicts(all_pinctrl, all_usages, all_gpio_usages, all_node_status):
+    """检测 pinctrl-N 与 *-gpios 的 GPIO pin 冲突。
+
+    参数:
+      all_pinctrl:     dict[label → PinctrlNode]
+      all_usages:      dict[(node_path, pinctrl_index) → (filepath, lineno, refs)]
+      all_gpio_usages: dict[(node_path, prop_name) → GpioUsage]
+      all_node_status: dict[node_path → status 字符串]
 
     冲突判定:
-      - 按 pinctrl 状态索引分组比较 (pinctrl-0 之间、pinctrl-1 之间、... 各自独立)。
-      - 不同状态 (如 pinctrl-0 vs pinctrl-1) 天然允许共用 pin, 不算冲突。
-      - 对同一状态、同一个 GPIO pin, 只有当不同节点引用了不同的 ref_label 时才冲突。
-      - 多个节点引用同一 ref_label (共享同一份配置) 视为正常。
+      - 被 disabled 的节点 (status != "okay") 不视为冲突方, 其占用被跳过。
+      - pinctrl vs pinctrl: 同一状态索引内, 不同节点引用不同 ref_label 且占用同一 pin
+        → 冲突 (不同状态如 pinctrl-0 vs pinctrl-1 天然允许共用, 不算冲突)。
+      - gpio vs gpio: 不同节点通过 *-gpios 占用同一 pin → 冲突。
+      - pinctrl vs gpio: 某个 pin 既被 pinctrl 复用(或占用)又被 (其它节点的) *-gpios
+        直接引用 → 冲突。
+      - 豁免: 同一节点内部的多个占用 (pinctrl 与 *-gpios 配套) 视为正常, 不算冲突;
+        多节点冲突时按节点聚合, 每个节点只保留一个代表。
     """
     from collections import defaultdict
 
-    # (pinctrl_index, pin_key) → { ref_label → [(node_path, filepath, lineno), ...] }
-    pin_owners = defaultdict(lambda: defaultdict(list))
+    def is_disabled(node_path):
+        return all_node_status.get(node_path) != 'okay'
 
+    # 按 pin_key 分组, 收集所有"占用标签"
+    # pinctrl 占用标签: 'p' + ref_label (同一 ref_label 被多个节点引用视为共享, 只算一个标签)
+    # gpio 占用标签: 'g' + node_path + '#' + prop_name
+    # pin_key → { 占用标签 → owner 详情 }
+    pin_owners = defaultdict(dict)
+
+    # --- 收集 pinctrl 占用 (按 ref_label 去重, 共享同一标签视为正常) ---
     for (node_path, pinctrl_index), (filepath, lineno, refs) in all_usages.items():
+        if is_disabled(node_path):
+            continue
         for ref_label in refs:
             pn = all_pinctrl.get(ref_label)
             if not pn:
                 continue
             for pe in pn.pins:
-                pin_owners[(pinctrl_index, pe.key)][ref_label].append(
-                    (node_path, filepath, lineno))
+                tag = ('p', ref_label)
+                if tag not in pin_owners[pe.key]:
+                    pin_owners[pe.key][tag] = {
+                        'node_path': node_path, 'filepath': filepath,
+                        'lineno': lineno, 'source': 'pinctrl',
+                        'ref_label': ref_label, 'func': pe.func,
+                    }
+
+    # --- 收集 gpio 占用 ---
+    for (node_path, prop_name), gpio_usage in all_gpio_usages.items():
+        if is_disabled(node_path):
+            continue
+        for (bank, pin) in gpio_usage.pins:
+            tag = ('g', node_path, prop_name)
+            if tag not in pin_owners[(bank, pin)]:
+                pin_owners[(bank, pin)][tag] = {
+                    'node_path': node_path, 'filepath': gpio_usage.filepath,
+                    'lineno': gpio_usage.lineno, 'source': 'gpio',
+                    'ref_label': prop_name, 'func': None,
+                }
 
     conflicts = {}
-    for (pinctrl_index, pin_key), ref_map in pin_owners.items():
-        # 只有当同一个状态、同一个 pin 被多个不同的 ref_label 占用时才冲突
-        if len(ref_map) >= 2:
-            owners = []
-            for ref_label, entries in ref_map.items():
-                # 每个 ref_label 取第一个节点作为代表 (同一 label 的多个节点视为共享)
-                node_path, filepath, lineno = entries[0]
-                owners.append((node_path, filepath, lineno, ref_label))
-            conflicts[(pinctrl_index, pin_key)] = owners
+    for pin_key, owner_map in pin_owners.items():
+        owners = list(owner_map.values())
+        if len(owners) < 2:
+            continue
+
+        # 豁免: 同一节点内部的占用视为配套使用, 不算冲突。
+        # 同一节点内 pinctrl 负责 pinmux、*-gpios 负责逻辑操作, 二者指向同一 pin 是正常的。
+        node_paths = set(o['node_path'] for o in owners)
+        if len(node_paths) == 1:
+            continue
+
+        # 按 node_path 聚合: 同一节点的多个占用 (pinctrl + gpio 配套) 归为一个代表。
+        # 每个节点优先取 pinctrl 引用作代表, 没有 pinctrl 则取 gpio 属性。
+        by_node = {}
+        for o in owners:
+            np = o['node_path']
+            if np not in by_node:
+                by_node[np] = o
+            else:
+                # 已有代表时, 若当前是 pinctrl 且原代表是 gpio, 则用 pinctrl 替换
+                if o['source'] == 'pinctrl' and by_node[np]['source'] == 'gpio':
+                    by_node[np] = o
+
+        conflict_owners = [
+            (o['node_path'], o['filepath'], o['lineno'],
+             o['source'], o['ref_label'], o['func'])
+            for o in by_node.values()
+        ]
+        conflicts[pin_key] = conflict_owners
 
     return conflicts
 
@@ -364,39 +566,44 @@ def _pin_key_to_name(pin_key):
 
 def print_conflicts(conflicts, all_pinctrl, base_dir):
     if not conflicts:
-        print("未发现 pinctrl 冲突。")
+        print("未发现 pinctrl / gpio 冲突。")
         return
 
     print(f"\n{'='*80}")
-    print(f"  pinctrl GPIO Pin 冲突报告")
+    print(f"  GPIO Pin 冲突报告 (pinctrl + *-gpios)")
     print(f"{'='*80}")
 
-    for (pinctrl_index, pin_key), owners in sorted(conflicts.items()):
+    for pin_key, owners in sorted(conflicts.items()):
         pin_name = _pin_key_to_name(pin_key)
-        print(f"\n[冲突] pinctrl-{pinctrl_index} {pin_name} (bank={pin_key[0]}, pin={pin_key[1]}) 被以下节点同时占用:")
+        print(f"\n[冲突] {pin_name} (bank={pin_key[0]}, pin={pin_key[1]}) 被以下节点同时占用:")
         print(f"{'-'*60}")
-        for node_path, filepath, lineno, ref_label in owners:
+        for owner in owners:
+            node_path, filepath, lineno, source, ref_label, func = owner
             rel_path = os.path.relpath(filepath, base_dir) if os.path.isabs(filepath) else filepath
             print(f"  节点: {node_path}")
-            print(f"  引用: &{ref_label}")
+            if source == 'pinctrl':
+                print(f"  引用: &{ref_label} (pinctrl)")
+                pn = all_pinctrl.get(ref_label)
+                if pn:
+                    for pe in pn.pins:
+                        if pe.key == pin_key:
+                            print(f"  配置: bank={pe.bank}, pin={pe.pin}, func={pe.func}, bias={pe.bias}")
+            else:
+                print(f"  属性: {ref_label} (gpio)")
             print(f"  位置: {rel_path}:{lineno}")
-            pn = all_pinctrl.get(ref_label)
-            if pn:
-                for pe in pn.pins:
-                    if pe.key == pin_key:
-                        print(f"  配置: bank={pe.bank}, pin={pe.pin}, func={pe.func}, bias={pe.bias}")
             print()
 
     print(f"{'='*80}")
     print(f"  共发现 {len(conflicts)} 个 GPIO pin 冲突")
 
 
-def print_summary(all_pinctrl, all_usages):
+def print_summary(all_pinctrl, all_usages, all_gpio_usages):
     print(f"\n{'='*80}")
-    print(f"  pinctrl 使用情况汇总")
+    print(f"  pinctrl / gpio 使用情况汇总")
     print(f"{'='*80}")
     print(f"  共 {len(all_pinctrl)} 个 pinctrl 节点定义")
     print(f"  共 {len(all_usages)} 个 pinctrl-N 引用 (覆盖后)")
+    print(f"  共 {len(all_gpio_usages)} 个 *-gpios 属性引用 (覆盖后)")
 
     from collections import defaultdict
     # 统计各状态索引的引用数量
@@ -420,7 +627,7 @@ def print_summary(all_pinctrl, all_usages):
     print()
 
 
-def print_all_pins(all_pinctrl, all_usages, base_dir):
+def print_all_pins(all_pinctrl, all_usages, all_gpio_usages, base_dir):
     from collections import defaultdict
     pin_owners_all = defaultdict(list)
     for (node_path, pinctrl_index), (filepath, lineno, refs) in all_usages.items():
@@ -431,14 +638,21 @@ def print_all_pins(all_pinctrl, all_usages, base_dir):
             for pe in pn.pins:
                 rel = os.path.relpath(filepath, base_dir)
                 pin_owners_all[(pinctrl_index, pe.key)].append(
-                    f"{node_path} <- &{ref_label} ({rel}:{lineno})")
+                    f"{node_path} <- &{ref_label} (pinctrl, {rel}:{lineno})")
+
+    for (node_path, prop_name), gpio_usage in all_gpio_usages.items():
+        for (bank, pin) in gpio_usage.pins:
+            rel = os.path.relpath(gpio_usage.filepath, base_dir)
+            pin_owners_all[(None, (bank, pin))].append(
+                f"{node_path} <- {prop_name} (gpio, {rel}:{gpio_usage.lineno})")
 
     print(f"\n{'='*80}")
-    print(f"  所有 pinctrl-N 占用的 GPIO Pin")
+    print(f"  所有 pinctrl-N / *-gpios 占用的 GPIO Pin")
     print(f"{'='*80}")
-    for (pinctrl_index, pin_key), owners in sorted(pin_owners_all.items()):
+    for (pinctrl_index, pin_key), owners in sorted(pin_owners_all.items(), key=lambda x: x[0][1]):
         pin_name = _pin_key_to_name(pin_key)
-        print(f"  pinctrl-{pinctrl_index} {pin_name}:")
+        prefix = f"pinctrl-{pinctrl_index}" if pinctrl_index is not None else "gpio"
+        print(f"  [{prefix}] {pin_name}:")
         for o in owners:
             print(f"    - {o}")
 
@@ -476,22 +690,23 @@ def main():
         sys.exit(1)
 
     print(f"解析设备树: {entry}")
-    all_pinctrl, all_usages = collect_all(entry)
+    all_pinctrl, all_usages, all_gpio_usages, all_node_status = collect_all(entry)
 
-    print(f"解析完成: {len(all_pinctrl)} 个 pinctrl 定义, {len(all_usages)} 个 pinctrl-N 引用 (覆盖后)")
+    print(f"解析完成: {len(all_pinctrl)} 个 pinctrl 定义, "
+          f"{len(all_usages)} 个 pinctrl-N 引用, {len(all_gpio_usages)} 个 *-gpios 引用 (覆盖后)")
 
     if args.summary_only:
-        print_summary(all_pinctrl, all_usages)
+        print_summary(all_pinctrl, all_usages, all_gpio_usages)
         sys.exit(0)
 
-    conflicts = find_conflicts(all_pinctrl, all_usages)
+    conflicts = find_conflicts(all_pinctrl, all_usages, all_gpio_usages, all_node_status)
     print_conflicts(conflicts, all_pinctrl, base_dir)
 
     if args.verbose:
-        print_summary(all_pinctrl, all_usages)
+        print_summary(all_pinctrl, all_usages, all_gpio_usages)
 
     if args.all_pins:
-        print_all_pins(all_pinctrl, all_usages, base_dir)
+        print_all_pins(all_pinctrl, all_usages, all_gpio_usages, base_dir)
 
 
 if __name__ == '__main__':

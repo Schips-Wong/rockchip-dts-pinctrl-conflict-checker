@@ -103,3 +103,23 @@ for line in content.split('\n'):
 ### e
 
 GPIO的冲突规则应该也包含进来，例如如果2个节点都有`enable-gpios = <&gpio1 RK_PA5 GPIO_ACTIVE_HIGH>;`也视为冲突。
+
+### f
+
+对于被`disabled`的节点（即`status = "okay";`不成立），不视为冲突节点，
+
+例如这里的`&dp0 `节点在最终是被禁用的
+
+
+```
+[冲突] GPIO1_RK_PA0 (bank=1, pin=0) 被以下节点同时占用:
+------------------------------------------------------------
+  节点: dp0
+  引用: &dp0m2_pins (pinctrl)
+  配置: bank=1, pin=0, func=5, bias=&pcfg_pull_none
+  位置: rk3588-nvr-demo.dtsi:149
+
+  节点: i2c7
+  属性: pwdn-gpios (gpio)
+  位置: rk3588-schips-cam-6x---mipi0-4lane-dcphy0-as-dphy.dtsi:186
+```
