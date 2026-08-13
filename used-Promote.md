@@ -100,3 +100,6 @@ for line in content.split('\n'):
 
 不单单是pintctl-0需要解析，像`pinctrl-1`、`pinctrl-2`等都需要同样的处理
 
+### e
+
+GPIO的冲突规则应该也包含进来，例如如果2个节点都有`enable-gpios = <&gpio1 RK_PA5 GPIO_ACTIVE_HIGH>;`也视为冲突。
