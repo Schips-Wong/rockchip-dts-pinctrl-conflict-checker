@@ -1,18 +1,20 @@
 #!/usr/bin/python3
 # -*- encoding=utf8 -*-
 """
-pinctrl-0 冲突检测工具
+pinctrl 冲突检测工具
 
-功能: 解析 Linux 设备树中的 #include 包含关系，收集所有节点的 pinctrl-0 属性，
-      将其展开为具体的 GPIO (bank, pin) 占用，检测不同节点之间的 pin 冲突。
+功能: 解析 Linux 设备树中的 #include 包含关系，收集所有节点的 pinctrl-N 属性
+      (pinctrl-0 / pinctrl-1 / pinctrl-2 / ...)，将其展开为具体的 GPIO
+      (bank, pin) 占用，检测不同节点之间的 pin 冲突。
 
 原理:
   1. 从主 dts 出发，递归解析 #include 链
   2. 在每个 dts/dtsi 文件中收集:
      a) pinctrl 节点定义:  node_name { rockchip,pins = <bank pin func bias>; }
-     b) 消费节点的 pinctrl-0 引用:  &node { pinctrl-0 = <&pinmux_a &pinmux_b>; }
-  3. 将 pinctrl-0 中的引用展开为 (bank, pin) 列表
-  4. 检测不同节点是否占用了相同的 (bank, pin)，报告冲突
+     b) 消费节点的 pinctrl-N 引用:  &node { pinctrl-0 = <&pinmux_a &pinmux_b>; }
+  3. 将 pinctrl-N 中的引用展开为 (bank, pin) 列表
+  4. 按状态索引分组检测: 同一状态 (如 pinctrl-0) 内不同节点引用不同 pinmux
+     且占用同一 (bank, pin) 时报告冲突; 不同状态之间天然允许共用 pin, 不算冲突
 
 用法:
   python3 check_pinctrl_conflict.py <主dts文件>
@@ -62,15 +64,16 @@ class PinctrlNode:
 
 
 class NodeUsage:
-    """一个设备节点对 pinctrl-0 的使用"""
-    def __init__(self, node_path, filepath, lineno):
+    """一个设备节点对某个 pinctrl-N 状态的使用"""
+    def __init__(self, node_path, filepath, lineno, pinctrl_index):
         self.node_path = node_path
         self.filepath = filepath
         self.lineno = lineno
+        self.pinctrl_index = pinctrl_index  # 0 对应 pinctrl-0, 1 对应 pinctrl-1, ...
         self.refs = []
 
     def __repr__(self):
-        return f"NodeUsage({self.node_path}, refs={self.refs})"
+        return f"NodeUsage({self.node_path}, pinctrl-{self.pinctrl_index}, refs={self.refs})"
 
 
 # ============================================================
@@ -207,22 +210,24 @@ class DtsFile:
                             pending_lines = []
                 continue
 
-            # --- 任意节点内部: 收集 pinctrl-0 引用 ---
+            # --- 任意节点内部: 收集 pinctrl-N 引用 (N = 0, 1, 2, ...) ---
             # 单行格式
-            pinctrl_m = re.match(r'pinctrl-0\s*=\s*<(.+)>;', stripped)
+            pinctrl_m = re.match(r'pinctrl-(\d+)\s*=\s*<(.+)>;', stripped)
             if pinctrl_m:
-                refs_str = pinctrl_m.group(1)
+                pinctrl_index = int(pinctrl_m.group(1))
+                refs_str = pinctrl_m.group(2)
                 refs = re.findall(r'&([\w]+)', refs_str)
                 node_path = '/'.join(node_stack) if node_stack else '/'
-                usage = NodeUsage(node_path, self.filepath, lineno)
+                usage = NodeUsage(node_path, self.filepath, lineno, pinctrl_index)
                 usage.refs = refs
                 self.node_usages.append(usage)
                 continue
 
             # 跨行格式
-            pinctrl_start_m = re.match(r'pinctrl-0\s*=\s*<(.+)', stripped)
+            pinctrl_start_m = re.match(r'pinctrl-(\d+)\s*=\s*<(.+)', stripped)
             if pinctrl_start_m:
-                refs_combined = pinctrl_start_m.group(1)
+                pinctrl_index = int(pinctrl_start_m.group(1))
+                refs_combined = pinctrl_start_m.group(2)
                 j = i + 1
                 while j < len(lines):
                     cont_line = lines[j].strip()
@@ -232,7 +237,7 @@ class DtsFile:
                     j += 1
                 refs = re.findall(r'&([\w]+)', refs_combined)
                 node_path = '/'.join(node_stack) if node_stack else '/'
-                usage = NodeUsage(node_path, self.filepath, lineno)
+                usage = NodeUsage(node_path, self.filepath, lineno, pinctrl_index)
                 usage.refs = refs
                 self.node_usages.append(usage)
                 continue
@@ -267,10 +272,10 @@ class DtsFile:
 
 def collect_all(entry_dts, visited=None):
     """
-    递归解析 #include 链，收集所有 pinctrl 定义和 pinctrl-0 引用。
+    递归解析 #include 链，收集所有 pinctrl 定义和 pinctrl-N 引用。
 
     设备树覆盖语义:
-      - 同一节点路径的 pinctrl-0: 后 include 的覆盖先 include 的
+      - 同一节点路径、同一状态索引的 pinctrl-N: 后 include 的覆盖先 include 的
       - 同一 label 的 pinctrl 节点定义: 后 include 的覆盖先 include 的
       - 所以使用 dict 存储，后出现的自动覆盖先出现的
     """
@@ -291,10 +296,10 @@ def collect_all(entry_dts, visited=None):
 
     # 当前文件的 pinctrl 定义: label → PinctrlNode
     all_pinctrl = dict(dts.pinctrl_nodes)
-    # 当前文件的 pinctrl-0 引用: node_path → (filepath, lineno, refs)
+    # 当前文件的 pinctrl-N 引用: (node_path, index) → (filepath, lineno, refs)
     all_usages = {}
     for u in dts.node_usages:
-        all_usages[u.node_path] = (u.filepath, u.lineno, u.refs)
+        all_usages[(u.node_path, u.pinctrl_index)] = (u.filepath, u.lineno, u.refs)
 
     for inc_path in dts.includes:
         sub_pinctrl, sub_usages = collect_all(inc_path, visited)
@@ -310,38 +315,40 @@ def collect_all(entry_dts, visited=None):
 # ============================================================
 
 def find_conflicts(all_pinctrl, all_usages):
-    """检测 pinctrl-0 的 pin 冲突。
-    all_usages: dict[node_path → (filepath, lineno, refs)]
-    已经过设备树覆盖处理: 同一节点路径只保留最后出现的 pinctrl-0。
+    """检测 pinctrl-N 的 pin 冲突。
+    all_usages: dict[(node_path, pinctrl_index) → (filepath, lineno, refs)]
+    已经过设备树覆盖处理: 同一节点路径、同一状态索引只保留最后出现的引用。
 
     冲突判定:
-      对同一个 GPIO pin, 只有当不同节点引用了不同的 ref_label 时才视为冲突。
-      如果多个节点引用的是同一个 ref_label (共享同一份 pinctrl 配置), 视为正常。
+      - 按 pinctrl 状态索引分组比较 (pinctrl-0 之间、pinctrl-1 之间、... 各自独立)。
+      - 不同状态 (如 pinctrl-0 vs pinctrl-1) 天然允许共用 pin, 不算冲突。
+      - 对同一状态、同一个 GPIO pin, 只有当不同节点引用了不同的 ref_label 时才冲突。
+      - 多个节点引用同一 ref_label (共享同一份配置) 视为正常。
     """
     from collections import defaultdict
 
-    # pin_key → { ref_label → [(node_path, filepath, lineno), ...] }
+    # (pinctrl_index, pin_key) → { ref_label → [(node_path, filepath, lineno), ...] }
     pin_owners = defaultdict(lambda: defaultdict(list))
 
-    for node_path, (filepath, lineno, refs) in all_usages.items():
+    for (node_path, pinctrl_index), (filepath, lineno, refs) in all_usages.items():
         for ref_label in refs:
             pn = all_pinctrl.get(ref_label)
             if not pn:
                 continue
             for pe in pn.pins:
-                pin_owners[pe.key][ref_label].append(
+                pin_owners[(pinctrl_index, pe.key)][ref_label].append(
                     (node_path, filepath, lineno))
 
     conflicts = {}
-    for key, ref_map in pin_owners.items():
-        # 只有当同一个 pin 被多个不同的 ref_label 占用时才冲突
+    for (pinctrl_index, pin_key), ref_map in pin_owners.items():
+        # 只有当同一个状态、同一个 pin 被多个不同的 ref_label 占用时才冲突
         if len(ref_map) >= 2:
             owners = []
             for ref_label, entries in ref_map.items():
                 # 每个 ref_label 取第一个节点作为代表 (同一 label 的多个节点视为共享)
                 node_path, filepath, lineno = entries[0]
                 owners.append((node_path, filepath, lineno, ref_label))
-            conflicts[key] = owners
+            conflicts[(pinctrl_index, pin_key)] = owners
 
     return conflicts
 
@@ -357,16 +364,16 @@ def _pin_key_to_name(pin_key):
 
 def print_conflicts(conflicts, all_pinctrl, base_dir):
     if not conflicts:
-        print("未发现 pinctrl-0 冲突。")
+        print("未发现 pinctrl 冲突。")
         return
 
     print(f"\n{'='*80}")
-    print(f"  pinctrl-0 GPIO Pin 冲突报告")
+    print(f"  pinctrl GPIO Pin 冲突报告")
     print(f"{'='*80}")
 
-    for pin_key, owners in sorted(conflicts.items()):
+    for (pinctrl_index, pin_key), owners in sorted(conflicts.items()):
         pin_name = _pin_key_to_name(pin_key)
-        print(f"\n[冲突] {pin_name} (bank={pin_key[0]}, pin={pin_key[1]}) 被以下节点同时占用:")
+        print(f"\n[冲突] pinctrl-{pinctrl_index} {pin_name} (bank={pin_key[0]}, pin={pin_key[1]}) 被以下节点同时占用:")
         print(f"{'-'*60}")
         for node_path, filepath, lineno, ref_label in owners:
             rel_path = os.path.relpath(filepath, base_dir) if os.path.isabs(filepath) else filepath
@@ -386,47 +393,52 @@ def print_conflicts(conflicts, all_pinctrl, base_dir):
 
 def print_summary(all_pinctrl, all_usages):
     print(f"\n{'='*80}")
-    print(f"  pinctrl-0 使用情况汇总")
+    print(f"  pinctrl 使用情况汇总")
     print(f"{'='*80}")
     print(f"  共 {len(all_pinctrl)} 个 pinctrl 节点定义")
-    print(f"  共 {len(all_usages)} 个节点使用了 pinctrl-0 (覆盖后)")
+    print(f"  共 {len(all_usages)} 个 pinctrl-N 引用 (覆盖后)")
 
     from collections import defaultdict
+    # 统计各状态索引的引用数量
+    index_count = defaultdict(int)
     pin_usage_count = defaultdict(int)
-    for node_path, (filepath, lineno, refs) in all_usages.items():
+    for (node_path, pinctrl_index), (filepath, lineno, refs) in all_usages.items():
+        index_count[pinctrl_index] += 1
         for ref_label in refs:
             pn = all_pinctrl.get(ref_label)
             if pn:
                 for pe in pn.pins:
-                    pin_usage_count[pe.key] += 1
+                    pin_usage_count[(pinctrl_index, pe.key)] += 1
 
-    print(f"  共 {len(pin_usage_count)} 个 GPIO pin 被 pinctrl-0 引用")
+    for idx in sorted(index_count):
+        print(f"  pinctrl-{idx}: {index_count[idx]} 个引用")
+
+    print(f"  共 {len(pin_usage_count)} 个 (状态, GPIO pin) 被引用")
     multi = [(k, v) for k, v in pin_usage_count.items() if v >= 2]
     if multi:
-        print(f"  其中 {len(multi)} 个 pin 被多次引用 (潜在冲突)")
+        print(f"  其中 {len(multi)} 个 (状态, pin) 被多次引用 (潜在冲突)")
     print()
 
 
 def print_all_pins(all_pinctrl, all_usages, base_dir):
     from collections import defaultdict
     pin_owners_all = defaultdict(list)
-    for node_path, (filepath, lineno, refs) in all_usages.items():
+    for (node_path, pinctrl_index), (filepath, lineno, refs) in all_usages.items():
         for ref_label in refs:
             pn = all_pinctrl.get(ref_label)
             if not pn:
                 continue
             for pe in pn.pins:
-                pin_name = _pin_key_to_name(pe.key)
                 rel = os.path.relpath(filepath, base_dir)
-                pin_owners_all[pe.key].append(
+                pin_owners_all[(pinctrl_index, pe.key)].append(
                     f"{node_path} <- &{ref_label} ({rel}:{lineno})")
 
     print(f"\n{'='*80}")
-    print(f"  所有 pinctrl-0 占用的 GPIO Pin")
+    print(f"  所有 pinctrl-N 占用的 GPIO Pin")
     print(f"{'='*80}")
-    for key, owners in sorted(pin_owners_all.items()):
-        pin_name = _pin_key_to_name(key)
-        print(f"  {pin_name}:")
+    for (pinctrl_index, pin_key), owners in sorted(pin_owners_all.items()):
+        pin_name = _pin_key_to_name(pin_key)
+        print(f"  pinctrl-{pinctrl_index} {pin_name}:")
         for o in owners:
             print(f"    - {o}")
 
@@ -437,7 +449,7 @@ def print_all_pins(all_pinctrl, all_usages, base_dir):
 
 def main():
     parser = argparse.ArgumentParser(
-        description='设备树 pinctrl-0 冲突检测工具',
+        description='设备树 pinctrl 冲突检测工具',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例:
@@ -452,7 +464,7 @@ def main():
     parser.add_argument('--summary-only', action='store_true',
                         help='仅显示汇总信息')
     parser.add_argument('--all-pins', action='store_true',
-                        help='列出所有被 pinctrl-0 占用的 pin 及所属节点')
+                        help='列出所有被 pinctrl-N 占用的 pin 及所属节点')
 
     args = parser.parse_args()
 
@@ -466,7 +478,7 @@ def main():
     print(f"解析设备树: {entry}")
     all_pinctrl, all_usages = collect_all(entry)
 
-    print(f"解析完成: {len(all_pinctrl)} 个 pinctrl 定义, {len(all_usages)} 个 pinctrl-0 引用 (覆盖后)")
+    print(f"解析完成: {len(all_pinctrl)} 个 pinctrl 定义, {len(all_usages)} 个 pinctrl-N 引用 (覆盖后)")
 
     if args.summary_only:
         print_summary(all_pinctrl, all_usages)

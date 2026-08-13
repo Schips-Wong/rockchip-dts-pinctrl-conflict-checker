@@ -95,3 +95,8 @@ for line in content.split('\n'):
 - 主要针对 Rockchip 平台的 `RK_Pxx` 引脚命名（`RK_PA0` ~ `RK_PD7`）以及 `rockchip,pins` 格式。
 - 假定 `pinctrl-0` 属性遵循"后者完全覆盖前者"的替换语义（与 DTC 对 phandle 数组属性的一致）。
 
+
+### d
+
+不单单是pintctl-0需要解析，像`pinctrl-1`、`pinctrl-2`等都需要同样的处理
+
