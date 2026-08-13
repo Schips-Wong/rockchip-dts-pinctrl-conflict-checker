@@ -105,12 +105,19 @@ class DtsFile:
     def parse(self):
         base_dir = os.path.dirname(self.filepath)
         with open(self.filepath, 'r', encoding='utf-8', errors='replace') as f:
-            lines = f.readlines()
+            content = f.read()
 
-        # --- 第一步: 去除注释 ---
+        # --- 第一步: 去除注释 (保持行号不变) ---
+        # 1) 先整体去除跨行块注释 /* ... */ (DOTALL 让 . 匹配换行)
+        #    用等量换行符替换注释内容, 保证行号不错位
+        def _blank_out_block_comment(m):
+            # 保留注释内的换行符数量, 其余字符替换为空格
+            return re.sub(r'[^\n]', ' ', m.group(0))
+
+        content = re.sub(r'/\*.*?\*/', _blank_out_block_comment, content, flags=re.DOTALL)
+        # 2) 再逐行去除 // 行注释 (行注释不跨行, 不影响行号)
         cleaned_lines = []
-        for line in lines:
-            line = re.sub(r'/\*.*?\*/', '', line)
+        for line in content.split('\n'):
             line = re.sub(r'//.*', '', line)
             cleaned_lines.append(line)
 
