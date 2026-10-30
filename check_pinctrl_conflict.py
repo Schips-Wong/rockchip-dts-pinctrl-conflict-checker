@@ -162,9 +162,20 @@ class DtsFile:
     def _parse_nodes(self, lines):
         """
         逐行解析节点层级和 pinctrl 定义 / pinctrl-0 引用。
+
+        节点身份规则（与设备树 overlay 语义保持一致）:
+          - 带标签的定义 `label: node@addr {` 以 label 作为稳定身份，
+            这样后面的 `&label { ... }` 覆盖能落到同一个节点上；
+          - `&label { ... }` 覆盖同样以 label 作为身份；
+          - 无标签节点使用父路径 + 节点名。
+
+        旧实现只识别 `&label {`，遇到 `label: node {` 时不会入栈，
+        导致随后的 `};` 把父节点提前弹出、后续节点被错误归到根节点。
         """
-        node_stack = []             # 节点名栈
-        inside_pinctrl = False      # 是否在 &pinctrl { } 内部
+        # 栈元素: (node_path, label, lineno)
+        node_stack = []
+        inside_pinctrl = False
+        pinctrl_depth = 0
 
         # pinctrl 子节点收集状态
         current_label = None
@@ -172,74 +183,102 @@ class DtsFile:
         collecting = False
         pending_lines = []
 
+        def current_path():
+            return node_stack[-1][0] if node_stack else '/'
+
         for i, line in enumerate(lines):
             lineno = i + 1
             stripped = line.strip()
             if not stripped:
                 continue
-
-            # --- 检测节点开始 ---
-            node_start_m = re.match(r'(&?[\w@\-\./]+)\s*\{', stripped)
-            if node_start_m:
-                node_name = node_start_m.group(1).lstrip('&')
-                node_stack.append(node_name)
-
-                if node_name == 'pinctrl' or 'pinctrl' in node_name:
-                    inside_pinctrl = True
+            # 预处理指令（#include 已单独处理）不参与节点解析
+            if stripped.startswith('#'):
                 continue
 
-            # --- 检测节点结束 ---
-            if stripped == '};':
-                if node_stack:
-                    popped = node_stack.pop()
-                    if popped == 'pinctrl' or 'pinctrl' in popped:
-                        inside_pinctrl = False
-
-                if collecting:
+            # --- 节点结束 ---
+            if re.fullmatch(r'}\s*;', stripped):
+                if collecting and pending_lines:
                     self._flush_pins(current_label, current_lineno, pending_lines)
                     collecting = False
                     pending_lines = []
+                if node_stack:
+                    node_stack.pop()
+                if inside_pinctrl and len(node_stack) < pinctrl_depth:
+                    inside_pinctrl = False
+                    pinctrl_depth = 0
+                continue
+
+            # --- 节点开始（支持 label: node、&label、&{/path}） ---
+            overlay_path_m = re.match(r'^&?\{(/[^}]*)\}\s*\{\s*$', stripped)
+            node_start_m = re.match(
+                r'^(?:([A-Za-z_]\w*)\s*:\s*)?'
+                r'(&?[A-Za-z0-9_@\-\.\,\+/]+)\s*\{\s*$',
+                stripped)
+
+            if overlay_path_m:
+                node_name = overlay_path_m.group(1)
+                node_stack.append((node_name, None, lineno))
+                continue
+
+            if node_start_m:
+                label = node_start_m.group(1)
+                raw_name = node_start_m.group(2)
+                if raw_name.startswith('&'):
+                    name = raw_name[1:]
+                    node_path = name
+                elif raw_name == '/':
+                    name = '/'
+                    node_path = '/'
+                else:
+                    name = raw_name
+                    if label:
+                        # 标签是全局身份，保证 &label 覆盖能合并到定义节点
+                        node_path = label
+                    else:
+                        parent = node_stack[-1][0] if node_stack else '/'
+                        node_path = name if parent in ('', '/') else parent + '/' + name
+
+                node_stack.append((node_path, label, lineno))
+
+                base_name = name.split('@')[0]
+                if base_name.startswith('pinctrl') or label == 'pinctrl':
+                    inside_pinctrl = True
+                    pinctrl_depth = len(node_stack)
                 continue
 
             # --- pinctrl 内部: 收集 pinmux 子节点 ---
             if inside_pinctrl:
-                # 匹配标签节点:  label: name {
-                label_m = re.match(r'([\w]+)\s*:\s*[\w\-]+(\s*\{)', stripped)
-                if label_m:
-                    label = label_m.group(1)
-                    current_label = label
-                    current_lineno = lineno
-                    collecting = True
-                    pending_lines = []
-
-                    # 提取节点名推入栈 (从 label: name 中取 name 部分)
-                    rest = stripped[stripped.index(':') + 1:].strip()
-                    inner_name = rest.rstrip('{').strip()
-                    node_stack.append(inner_name)
+                if collecting:
+                    pending_lines.append(stripped)
+                    if stripped.rstrip().endswith(';'):
+                        self._flush_pins(current_label, current_lineno, pending_lines)
+                        collecting = False
+                        pending_lines = []
                     continue
 
-                # 在 pinctrl 子节点内部, 收集 rockchip,pins 行
-                if collecting:
-                    if 'rockchip,pins' in stripped:
-                        pending_lines.append(stripped)
-                        if stripped.rstrip().endswith(';'):
-                            self._flush_pins(current_label, current_lineno, pending_lines)
-                            collecting = False
-                            pending_lines = []
-                    elif pending_lines:
-                        pending_lines.append(stripped)
-                        if stripped.rstrip().endswith(';'):
-                            self._flush_pins(current_label, current_lineno, pending_lines)
-                            collecting = False
-                            pending_lines = []
+                if 'rockchip,pins' in stripped:
+                    # 找到最近的带标签祖先，作为这组 pin 的 label
+                    for _path, label, label_lineno in reversed(node_stack):
+                        if label:
+                            current_label = label
+                            current_lineno = label_lineno
+                            collecting = True
+                            pending_lines = [stripped]
+                            if stripped.rstrip().endswith(';'):
+                                self._flush_pins(current_label, current_lineno, pending_lines)
+                                collecting = False
+                                pending_lines = []
+                            break
+                    continue
+
+                # pinctrl 组内部的其他属性不需要当作消费者处理
                 continue
 
             # --- 任意节点内部: 收集 status 属性 ---
             status_m = re.match(r'status\s*=\s*"([^"]+)"\s*;', stripped)
             if status_m:
                 status_val = status_m.group(1)
-                node_path = '/'.join(node_stack) if node_stack else '/'
-                self.node_status[node_path] = (lineno, status_val)
+                self.node_status[current_path()] = (lineno, status_val)
                 continue
 
             # --- 任意节点内部: 收集 pinctrl-N 引用 (N = 0, 1, 2, ...) ---
@@ -249,8 +288,7 @@ class DtsFile:
                 pinctrl_index = int(pinctrl_m.group(1))
                 refs_str = pinctrl_m.group(2)
                 refs = re.findall(r'&([\w]+)', refs_str)
-                node_path = '/'.join(node_stack) if node_stack else '/'
-                usage = NodeUsage(node_path, self.filepath, lineno, pinctrl_index)
+                usage = NodeUsage(current_path(), self.filepath, lineno, pinctrl_index)
                 usage.refs = refs
                 self.node_usages.append(usage)
                 continue
@@ -268,8 +306,7 @@ class DtsFile:
                         break
                     j += 1
                 refs = re.findall(r'&([\w]+)', refs_combined)
-                node_path = '/'.join(node_stack) if node_stack else '/'
-                usage = NodeUsage(node_path, self.filepath, lineno, pinctrl_index)
+                usage = NodeUsage(current_path(), self.filepath, lineno, pinctrl_index)
                 usage.refs = refs
                 self.node_usages.append(usage)
                 continue
@@ -277,7 +314,7 @@ class DtsFile:
             # --- 任意节点内部: 收集 *-gpios / gpio 属性直接引用的 GPIO ---
             # 属性名包含 gpio (enable-gpios / reset-gpios / irq-gpio / gpio / gpios / xxx,rst-gpio 等)
             # 值格式: <&gpioX RK_PY flags> (可能多个, 逗号分隔, 可能跨行)
-            gpio_m = re.match(r'([\w\-]*(?:gpio|GPIO)[\w\-]*)\s*=\s*(.+)', stripped)
+            gpio_m = re.match(r'([\w\-,]*(?:gpio|GPIO)[\w\-]*)\s*=\s*(.+)', stripped)
             if gpio_m:
                 prop_name = gpio_m.group(1)
                 value_str = gpio_m.group(2).rstrip(';')
@@ -292,17 +329,21 @@ class DtsFile:
                             break
                         j += 1
 
-                # 提取 <&gpioX RK_PY flags>
+                # 提取 <&gpioX RK_PY flags>，也兼容直接用数字写 pin 的 <&gpioX 5 flags>
                 pins = []
-                for g in re.findall(r'&(gpio\d+)\s+(RK_P[A-D]\d+)', value_str):
+                for g in re.findall(r'&(gpio\d+)\s+(RK_P[A-D]\d+|\d+)\b', value_str):
                     gbank = GPIO_BANK_MAP.get(g[0])
-                    gpin = rk_pin_to_number(g[1])
+                    if g[1].isdigit():
+                        gpin = int(g[1])
+                        if gpin > 31:
+                            continue
+                    else:
+                        gpin = rk_pin_to_number(g[1])
                     if gbank is not None and gpin is not None:
                         pins.append((gbank, gpin))
 
                 if pins:
-                    node_path = '/'.join(node_stack) if node_stack else '/'
-                    gpio_usage = GpioUsage(node_path, prop_name, self.filepath, lineno)
+                    gpio_usage = GpioUsage(current_path(), prop_name, self.filepath, lineno)
                     gpio_usage.pins = pins
                     self.gpio_usages.append(gpio_usage)
                 continue
@@ -344,7 +385,7 @@ class DtsFile:
 # 全局数据收集: 递归解析 #include 树
 # ============================================================
 
-def collect_all(entry_dts):
+def collect_all(entry_dts, warnings=None, files=None):
     """
     递归解析 #include 链，收集 pinctrl 定义、pinctrl-N 引用、gpio 属性引用和节点状态。
 
@@ -355,13 +396,16 @@ def collect_all(entry_dts):
         - 文件内按行号顺序, include 语句和被包含文件内容插入到 include 行位置,
         - 同一 key 后出现的 (order 更大) 覆盖先出现的 (order 更小)。
 
+    warnings: 可选的 list, 用于收集解析警告 (文件缺失等), 供 GUI 展示。
+    files:    可选的 list, 用于收集实际解析到的文件路径。
+
     返回: (all_pinctrl, all_usages, all_gpio_usages, all_node_status)
     """
-    result = _collect_internal(entry_dts, set(), [0])
+    result = _collect_internal(entry_dts, set(), [0], warnings, files)
     return result
 
 
-def _collect_internal(entry_dts, visited, order_counter):
+def _collect_internal(entry_dts, visited, order_counter, warnings=None, files=None):
     """collect_all 的内部实现, 返回已剥掉 order 包装的结果。
 
     返回值结构: (all_pinctrl, all_usages, all_gpio_usages, all_node_status)
@@ -376,8 +420,14 @@ def _collect_internal(entry_dts, visited, order_counter):
     visited.add(entry_path)
 
     if not os.path.isfile(entry_path):
-        print(f"[WARN] 文件不存在, 跳过: {entry_path}", file=sys.stderr)
+        msg = f"文件不存在, 跳过: {entry_path}"
+        print(f"[WARN] {msg}", file=sys.stderr)
+        if warnings is not None:
+            warnings.append(msg)
         return {}, {}, {}, {}
+
+    if files is not None and entry_path not in files:
+        files.append(entry_path)
 
     dts = DtsFile(entry_path)
     dts.parse()
@@ -423,7 +473,7 @@ def _collect_internal(entry_dts, visited, order_counter):
         if kind == 'include':
             inc_path = ev[2]
             sub_pinctrl, sub_usages, sub_gpio, sub_status = _collect_internal(
-                inc_path, visited, order_counter)
+                inc_path, visited, order_counter, warnings, files)
             # 子文件结果已经是剥掉 order 的, 需要重新包装 order
             # 但子文件内部已按顺序分配 order, 这里直接以它们的相对顺序重建 order
             for k, v in sub_pinctrl.items():
@@ -483,7 +533,10 @@ def find_conflicts(all_pinctrl, all_usages, all_gpio_usages, all_node_status):
     from collections import defaultdict
 
     def is_disabled(node_path):
-        return all_node_status.get(node_path) != 'okay'
+        # 设备树中未写 status 的节点默认是启用的（okay），
+        # 只有显式写成非 okay/ok 的值才算禁用。
+        status = all_node_status.get(node_path)
+        return status is not None and status not in ('okay', 'ok')
 
     # 按 pin_key 分组, 收集所有"占用标签"
     # pinctrl 占用标签: 'p' + ref_label (同一 ref_label 被多个节点引用视为共享, 只算一个标签)

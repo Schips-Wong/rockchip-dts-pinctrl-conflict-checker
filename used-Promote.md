@@ -123,3 +123,9 @@ GPIO的冲突规则应该也包含进来，例如如果2个节点都有`enable-g
   属性: pwdn-gpios (gpio)
   位置: rk3588-schips-cam-6x---mipi0-4lane-dcphy0-as-dphy.dtsi:186
 ```
+
+## v2
+
+### a
+
+我希望把软件改成界面程序，指定一个dtb或者dts，列出当前的冲突关系，并允许提供一个编辑框，用于查询指定的gpio是否已经被使用。
