@@ -137,3 +137,25 @@ GPIO的冲突规则应该也包含进来，例如如果2个节点都有`enable-g
 1. 以同名dts作为解析逻辑（默认）
 
 2. 以dtb作为解析逻辑
+
+### c
+
+在`解析日志`中，对`实际解析文件`提到的文件做树形缩进。
+
+例如：
+
+```
+rk3588-nvr-demo-v10-ipc-4x-linux.dts
+├─rk3588-nvr-demo.dtsi
+│ ├─rk3588.dtsi
+│ │ ├─rk3588s.dtsi
+│ │ │ └─rk3588s-pinctrl.dtsi
+│ │ │   └─rk3588s-pinconf.dtsi
+│ │ └─rk3588-vccio3-pinctrl.dtsi
+│ │   └─rockchip-pinconf.dtsi
+│ ├─rk3588-nvr.dtsi
+│ │ └─rk3588-cpu-swap.dtsi
+│ └─rk3588-rk806-single.dtsi
+└─rk3588-ipc.dtsi
+  └─rk3588-linux.dtsi
+```

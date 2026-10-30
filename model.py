@@ -150,6 +150,8 @@ class AnalysisResult:
     gpio_usage_count: int = 0
     gpio_usage_active: int = 0
     files: List[str] = field(default_factory=list)
+    # 文件 → 该文件直接 include 的子文件（按出现顺序、保留重复），仅 DTS 解析有值
+    include_tree: Dict[str, List[str]] = field(default_factory=dict)
     warnings: List[str] = field(default_factory=list)
     parse_seconds: float = 0.0
 
@@ -223,6 +225,7 @@ def build_analysis(
     files: Iterable[str],
     warnings: Iterable[str],
     parse_seconds: float = 0.0,
+    include_tree: Optional[Dict[str, List[str]]] = None,
 ) -> AnalysisResult:
     """整理占用记录，计算每 pin 的占用者以及冲突集合。
 
@@ -302,6 +305,7 @@ def build_analysis(
         gpio_usage_count=gpio_usage_count,
         gpio_usage_active=gpio_usage_active,
         files=list(files),
+        include_tree=dict(include_tree or {}),
         warnings=unique_warnings,
         parse_seconds=parse_seconds,
     )

@@ -736,8 +736,8 @@ class DtsGuiApp:
 
         if result.uses_dts_source:
             self._append_log(f"实际解析文件（{len(result.files)}）：\n", "h")
-            for path in result.files:
-                self._append_log(f"  {result.relpath(path)}\n")
+            for line in self._file_tree_lines(result):
+                self._append_log(line + "\n")
             self._append_log("\n")
 
         if result.warnings:
@@ -753,6 +753,28 @@ class DtsGuiApp:
             "多个节点共享同一个 pinctrl 组不算冲突。\n",
             "muted",
         )
+
+    def _file_tree_lines(self, result: AnalysisResult) -> List[str]:
+        """把 include 关系渲染成树形缩进文本（与 #include 结构一致）。"""
+        if not result.files:
+            return []
+        root = result.files[0]
+        lines: List[str] = [result.relpath(root).replace(os.sep, "/")]
+
+        def walk(path: str, prefix: str, branch: Tuple[str, ...]) -> None:
+            children = result.include_tree.get(path, [])
+            for index, child in enumerate(children):
+                last = index == len(children) - 1
+                connector = "└─" if last else "├─"
+                name = result.relpath(child).replace(os.sep, "/")
+                if child in branch:
+                    lines.append(f"{prefix}{connector}{name}（循环引用）")
+                    continue
+                lines.append(f"{prefix}{connector}{name}")
+                walk(child, prefix + ("  " if last else "│ "), branch + (child,))
+
+        walk(root, "", (root,))
+        return lines
 
     # ========================================================
     # 冲突详情

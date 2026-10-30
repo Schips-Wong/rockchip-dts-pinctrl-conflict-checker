@@ -385,7 +385,7 @@ class DtsFile:
 # 全局数据收集: 递归解析 #include 树
 # ============================================================
 
-def collect_all(entry_dts, warnings=None, files=None):
+def collect_all(entry_dts, warnings=None, files=None, include_tree=None):
     """
     递归解析 #include 链，收集 pinctrl 定义、pinctrl-N 引用、gpio 属性引用和节点状态。
 
@@ -396,16 +396,19 @@ def collect_all(entry_dts, warnings=None, files=None):
         - 文件内按行号顺序, include 语句和被包含文件内容插入到 include 行位置,
         - 同一 key 后出现的 (order 更大) 覆盖先出现的 (order 更小)。
 
-    warnings: 可选的 list, 用于收集解析警告 (文件缺失等), 供 GUI 展示。
-    files:    可选的 list, 用于收集实际解析到的文件路径。
+    warnings:     可选的 list, 用于收集解析警告 (文件缺失等), 供 GUI 展示。
+    files:        可选的 list, 用于收集实际解析到的文件路径。
+    include_tree: 可选的 dict, 记录每个文件直接 include 的子文件路径列表
+                  (按出现顺序、保留重复), 供 GUI 以树形展示 include 关系。
 
     返回: (all_pinctrl, all_usages, all_gpio_usages, all_node_status)
     """
-    result = _collect_internal(entry_dts, set(), [0], warnings, files)
+    result = _collect_internal(entry_dts, set(), [0], warnings, files, include_tree)
     return result
 
 
-def _collect_internal(entry_dts, visited, order_counter, warnings=None, files=None):
+def _collect_internal(entry_dts, visited, order_counter, warnings=None, files=None,
+                      include_tree=None):
     """collect_all 的内部实现, 返回已剥掉 order 包装的结果。
 
     返回值结构: (all_pinctrl, all_usages, all_gpio_usages, all_node_status)
@@ -431,6 +434,10 @@ def _collect_internal(entry_dts, visited, order_counter, warnings=None, files=No
 
     dts = DtsFile(entry_path)
     dts.parse()
+
+    if include_tree is not None:
+        # 记录本文件直接 include 的子文件（按出现顺序，保留重复，便于树形展示）
+        include_tree.setdefault(entry_path, [p for _lineno, p in dts.includes])
 
     # 结果字典: key → (order, value), order 用于覆盖优先级判断
     all_pinctrl = {}        # label → (order, PinctrlNode)
@@ -473,7 +480,7 @@ def _collect_internal(entry_dts, visited, order_counter, warnings=None, files=No
         if kind == 'include':
             inc_path = ev[2]
             sub_pinctrl, sub_usages, sub_gpio, sub_status = _collect_internal(
-                inc_path, visited, order_counter, warnings, files)
+                inc_path, visited, order_counter, warnings, files, include_tree)
             # 子文件结果已经是剥掉 order 的, 需要重新包装 order
             # 但子文件内部已按顺序分配 order, 这里直接以它们的相对顺序重建 order
             for k, v in sub_pinctrl.items():

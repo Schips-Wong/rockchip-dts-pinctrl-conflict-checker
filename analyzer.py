@@ -136,10 +136,11 @@ def analyze_dts(entry: str) -> AnalysisResult:
     t0 = time.perf_counter()
     warnings: List[str] = []
     files: List[str] = []
+    include_tree: Dict[str, List[str]] = {}
     warn_seen: Set[str] = set()
 
     all_pinctrl, all_usages, all_gpio, all_status = dtscore.collect_all(
-        entry, warnings=warnings, files=files
+        entry, warnings=warnings, files=files, include_tree=include_tree
     )
 
     claims: List[PinClaim] = []
@@ -216,6 +217,7 @@ def analyze_dts(entry: str) -> AnalysisResult:
         files=files,
         warnings=warnings,
         parse_seconds=time.perf_counter() - t0,
+        include_tree=include_tree,
     )
 
 
