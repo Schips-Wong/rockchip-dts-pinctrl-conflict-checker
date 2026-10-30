@@ -24,7 +24,14 @@ import tkinter.font as tkfont
 from tkinter import filedialog, messagebox, ttk
 from typing import Dict, List, Optional, Tuple
 
-from analyzer import analyze
+from analyzer import (
+    DTB_SOURCE_BINARY,
+    DTB_SOURCE_DTS,
+    SiblingDtsMissing,
+    analyze,
+    find_sibling_dts,
+    is_dtb_file,
+)
 from model import (
     AnalysisResult,
     Pin,
@@ -37,6 +44,13 @@ from report import build_markdown, default_report_name
 
 
 APP_TITLE = "Rockchip 设备树 GPIO 冲突检测器"
+
+# DTB 解析方式（下拉框显示文本）；默认使用同名 DTS 解析
+MODE_SIBLING_DTS = "同名 DTS 解析"
+MODE_BINARY = "DTB 二进制解析"
+DTB_MODES = (MODE_SIBLING_DTS, MODE_BINARY)
+DEFAULT_DTB_MODE = MODE_SIBLING_DTS
+
 COLOR_TEXT = "#1f2937"
 COLOR_MUTED = "#667085"
 COLOR_RED = "#b42318"
@@ -64,12 +78,27 @@ def _short_func(claim: PinClaim) -> str:
     return f"func={claim.func}"
 
 
+def _kind_badge(kind: str) -> Tuple[str, str]:
+    """返回 (徽标文字, 颜色)，用于提示本次结果来自哪种解析逻辑。"""
+    if kind == "dtb":
+        return "DTB", COLOR_BLUE
+    if kind == "dtb_dts":
+        return "DTB→DTS", COLOR_ORANGE
+    return "DTS", COLOR_MUTED
+
+
 def _status_text(claim: PinClaim) -> str:
     return "启用" if claim.active else f"禁用（{claim.status}）"
 
 
 class DtsGuiApp:
-    def __init__(self, root: tk.Tk, initial_path: Optional[str] = None, initial_query: Optional[str] = None):
+    def __init__(
+        self,
+        root: tk.Tk,
+        initial_path: Optional[str] = None,
+        initial_query: Optional[str] = None,
+        initial_dtb_mode: Optional[str] = None,
+    ):
         self.root = root
         self.result: Optional[AnalysisResult] = None
         self.current_path: Optional[str] = None
@@ -80,6 +109,7 @@ class DtsGuiApp:
         self._conflict_pins: Dict[str, Pin] = {}
         self._query_pins: Dict[str, Pin] = {}
         self._initial_query = initial_query
+        self._initial_dtb_mode = initial_dtb_mode
 
         self.family = self._pick_font_family()
         self._configure_root()
@@ -87,6 +117,9 @@ class DtsGuiApp:
         self._build_ui()
         self._bind_shortcuts()
         self._set_empty_state()
+
+        if self._initial_dtb_mode in DTB_MODES:
+            self.dtb_mode_var.set(self._initial_dtb_mode)
 
         if initial_path:
             self.root.after(80, lambda: self.load_file(initial_path))
@@ -202,8 +235,20 @@ class DtsGuiApp:
         self.export_btn = ttk.Button(outer, text="导出报告", command=self.on_export)
         self.export_btn.grid(row=0, column=4, padx=(0, 8))
 
+        ttk.Label(outer, text="DTB 解析方式").grid(row=0, column=5, padx=(0, 6))
+        self.dtb_mode_var = tk.StringVar(value=DEFAULT_DTB_MODE)
+        self.dtb_mode_combo = ttk.Combobox(
+            outer,
+            textvariable=self.dtb_mode_var,
+            state="readonly",
+            width=16,
+            values=DTB_MODES,
+        )
+        self.dtb_mode_combo.grid(row=0, column=6, padx=(0, 8))
+        self.dtb_mode_combo.bind("<<ComboboxSelected>>", self._on_dtb_mode_change)
+
         self.progress = ttk.Progressbar(outer, mode="indeterminate", length=110)
-        self.progress.grid(row=0, column=5)
+        self.progress.grid(row=0, column=7)
         self.progress.grid_remove()
 
         summary = ttk.Frame(self.root, padding=(12, 0, 12, 6))
@@ -476,28 +521,76 @@ class DtsGuiApp:
         self._last_dir = os.path.dirname(path)
         self._start_parse(path)
 
+    def _dtb_source(self) -> str:
+        """当前选择的 DTB 解析方式。"""
+        return DTB_SOURCE_DTS if self.dtb_mode_var.get() == MODE_SIBLING_DTS else DTB_SOURCE_BINARY
+
+    def _on_dtb_mode_change(self, _event=None) -> None:
+        """切换解析方式后，如果当前打开的就是 DTB，则立即用新方式重新解析。"""
+        if self.busy or not self.current_path:
+            return
+        try:
+            if not is_dtb_file(self.current_path):
+                return
+        except OSError:
+            return
+        self.load_file(self.current_path)
+
     def _start_parse(self, path: str) -> None:
+        source = self._dtb_source()
+        sibling: Optional[str] = None
+        is_dtb = is_dtb_file(path)
+
+        if is_dtb and source == DTB_SOURCE_DTS:
+            sibling = find_sibling_dts(path)
+            if sibling is None:
+                expected = os.path.splitext(path)[0] + ".dts"
+                if not messagebox.askyesno(
+                    APP_TITLE,
+                    f"当前 DTB 解析方式为「{MODE_SIBLING_DTS}」，但未找到同名 DTS 文件：\n"
+                    f"{expected}\n\n"
+                    f"是否改用「{MODE_BINARY}」继续解析该 DTB？",
+                ):
+                    self.summary_label.configure(text="已取消解析：未找到同名 DTS 文件")
+                    self.kind_badge.configure(text="未解析", bg=COLOR_MUTED)
+                    return
+                self.dtb_mode_var.set(MODE_BINARY)
+                source = DTB_SOURCE_BINARY
+
         self.busy = True
         self._token += 1
         token = self._token
         self._set_busy_ui(True)
         self.file_label.configure(text=os.path.basename(path))
-        self.kind_badge.configure(
-            text="DTB" if path.lower().endswith(".dtb") else "DTS",
-            bg=COLOR_BLUE if path.lower().endswith(".dtb") else COLOR_MUTED,
+
+        badge_text, badge_color = _kind_badge(
+            "dtb_dts" if (is_dtb and source == DTB_SOURCE_DTS) else ("dtb" if is_dtb else "dts")
         )
+        self.kind_badge.configure(text=badge_text, bg=badge_color)
+
+        header = f"正在解析：\n{path}\n"
+        if is_dtb and source == DTB_SOURCE_DTS and sibling:
+            header += f"解析方式：{MODE_SIBLING_DTS} —— {sibling}\n"
+        if is_dtb and source == DTB_SOURCE_BINARY:
+            header += "\n读取二进制 DTB（无文件行号）。"
+        else:
+            header += "\nDTS 会递归读取 include 链，文件较多时需要几秒钟。"
         self.summary_label.configure(text="正在解析，请稍候…")
         self.detail_text.configure(state="normal")
-        self._set_text(self.detail_text, f"正在解析：\n{path}\n\nDTS 会递归读取 include 链，文件较多时需要几秒钟。")
+        self._set_text(self.detail_text, header)
         self.notebook.select(self.tab_conflicts)
 
-        threading.Thread(target=self._parse_worker, args=(path, token), daemon=True).start()
+        threading.Thread(
+            target=self._parse_worker, args=(path, source, token), daemon=True
+        ).start()
         self.root.after(80, self._poll_parse_queue)
 
-    def _parse_worker(self, path: str, token: int) -> None:
+    def _parse_worker(self, path: str, source: str, token: int) -> None:
         try:
-            result = analyze(path)
+            result = analyze(path, dtb_source=source)
             self._queue.put(("ok", token, result))
+        except SiblingDtsMissing as exc:
+            self._queue.put(("error", token, str(exc)))
         except Exception:
             self._queue.put(("error", token, traceback.format_exc()))
 
@@ -534,6 +627,10 @@ class DtsGuiApp:
                 widget.state(state)
             except tk.TclError:
                 pass
+        try:
+            self.dtb_mode_combo.configure(state="disabled" if busy else "readonly")
+        except tk.TclError:
+            pass
         if busy:
             self.progress.grid()
             self.progress.start(12)
@@ -564,10 +661,8 @@ class DtsGuiApp:
     def _render_result(self, result: AnalysisResult) -> None:
         self._conflict_pins.clear()
 
-        self.kind_badge.configure(
-            text="DTB" if result.kind == "dtb" else "DTS",
-            bg=COLOR_BLUE if result.kind == "dtb" else COLOR_MUTED,
-        )
+        badge_text, badge_color = _kind_badge(result.kind)
+        self.kind_badge.configure(text=badge_text, bg=badge_color)
         self.file_label.configure(text=result.file_name)
         self.summary_label.configure(
             text=(
@@ -639,7 +734,7 @@ class DtsGuiApp:
             f"冲突 pin：{result.conflict_count}\n\n"
         )
 
-        if result.kind == "dts":
+        if result.uses_dts_source:
             self._append_log(f"实际解析文件（{len(result.files)}）：\n", "h")
             for path in result.files:
                 self._append_log(f"  {result.relpath(path)}\n")
@@ -1039,6 +1134,11 @@ class DtsGuiApp:
             "1. 点击「打开设备树…」，选择 .dts / .dtsi / .dtb 文件。\n\n"
             "2. 程序自动解析：#include 链（DTS）或 phandle（DTB），\n"
             "   收集 pinctrl-N 与 *-gpios 占用，计算冲突。\n\n"
+            "   .dtb 的解析方式可在工具栏「DTB 解析方式」中选择：\n"
+            "     · 同名 DTS 解析（默认）：改用同目录同名 .dts 做文本解析，\n"
+            "       能看到文件行号与 include 链，便于修改源码时定位；\n"
+            "       若找不到同名 .dts，会提示并可回退到二进制解析。\n"
+            "     · DTB 二进制解析：直接读编译结果，最贴近实际运行状态。\n\n"
             "3. 「冲突列表」显示争用同一 GPIO 的不同节点；\n"
             "   点击一行可在右侧查看来源、配置和文件行号。\n\n"
             "4. 「全部占用」可按引脚/节点/属性过滤完整占用列表。\n\n"
@@ -1054,6 +1154,7 @@ class DtsGuiApp:
             f"{APP_TITLE}\n\n"
             "在原命令行工具 check_pinctrl_conflict.py 的基础上增加了：\n"
             "  · .dtb 二进制解析（无需 dtc）\n"
+            "  · .dtb 默认按同名 DTS 源文件解析，可切换为二进制解析\n"
             "  · 图形化冲突列表与详情\n"
             "  · 指定 GPIO 占用查询\n"
             "  · Markdown 报告导出\n\n"
@@ -1069,6 +1170,7 @@ class DtsGuiApp:
             self.detail_text,
             "欢迎使用 Rockchip 设备树 GPIO 冲突检测器\n\n"
             "1. 点击左上角「打开设备树…」选择 .dts / .dtsi / .dtb；\n"
+            "   打开 .dtb 时默认按同名 DTS 解析，可在工具栏切换为二进制解析；\n"
             "2. 在「冲突列表」查看当前冲突关系；\n"
             "3. 在底部 GPIO 查询框输入引脚，检查是否已被使用。\n\n"
             "支持的查询格式：GPIO4_RK_PB2、GPIO4_B2、4 RK_PB2、4 10、gpio4 10、RK_PB2。",
@@ -1087,6 +1189,11 @@ def main() -> None:
 
     initial_path: Optional[str] = None
     initial_query: Optional[str] = None
+    initial_dtb_mode: Optional[str] = None
+
+    def dtb_mode_from(value: str) -> str:
+        return MODE_SIBLING_DTS if value.strip().lower() in ("dts", "source", "same-dts") else MODE_BINARY
+
     args = sys.argv[1:]
     i = 0
     while i < len(args):
@@ -1095,14 +1202,27 @@ def main() -> None:
             initial_query = args[i + 1]
             i += 2
             continue
+        if arg in ("--dtb-mode", "--dtb-source") and i + 1 < len(args):
+            initial_dtb_mode = dtb_mode_from(args[i + 1])
+            i += 2
+            continue
         if arg.startswith("--query="):
             initial_query = arg.split("=", 1)[1]
+        elif arg.startswith("--dtb-mode="):
+            initial_dtb_mode = dtb_mode_from(arg.split("=", 1)[1])
+        elif arg.startswith("--dtb-source="):
+            initial_dtb_mode = dtb_mode_from(arg.split("=", 1)[1])
         elif initial_path is None:
             initial_path = arg
         i += 1
 
     root = tk.Tk()
-    app = DtsGuiApp(root, initial_path=initial_path, initial_query=initial_query)
+    app = DtsGuiApp(
+        root,
+        initial_path=initial_path,
+        initial_query=initial_query,
+        initial_dtb_mode=initial_dtb_mode,
+    )
     # 防止 app 被垃圾回收
     root.app = app  # type: ignore[attr-defined]
     root.mainloop()

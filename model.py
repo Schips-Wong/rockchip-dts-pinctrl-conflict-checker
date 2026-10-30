@@ -177,7 +177,16 @@ class AnalysisResult:
 
     @property
     def kind_text(self) -> str:
-        return "DTB（编译后的最终状态）" if self.kind == "dtb" else "DTS（源文件 + include）"
+        if self.kind == "dtb":
+            return "DTB（编译后的最终状态）"
+        if self.kind == "dtb_dts":
+            return "DTB → 同名 DTS（源文件 + include）"
+        return "DTS（源文件 + include）"
+
+    @property
+    def uses_dts_source(self) -> bool:
+        """本次解析是否走了 DTS 文本解析（含 DTB 换成同名 DTS 的情况）。"""
+        return self.kind in ("dts", "dtb_dts")
 
     def relpath(self, path: str) -> str:
         if not path:

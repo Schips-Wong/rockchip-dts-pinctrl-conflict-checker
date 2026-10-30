@@ -56,7 +56,7 @@ def build_markdown(result: AnalysisResult, include_all_pins: bool = False) -> st
     )
     lines.append(f"| 被占用的 GPIO pin | {len(result.active_pins)} |")
     lines.append(f"| **冲突 pin** | **{result.conflict_count}** |")
-    if result.kind == "dts":
+    if result.uses_dts_source:
         lines.append(f"| 实际解析文件 | {len(result.files)} |")
     lines.append("")
 

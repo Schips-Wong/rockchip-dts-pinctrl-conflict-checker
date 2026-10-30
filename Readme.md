@@ -25,6 +25,10 @@ run_gui.bat
 python gui.py
 python gui.py rk3588-nvr-demo-v10-ipc-4x-linux.dts
 python gui.py rk3588-nvr-demo-v10-ipc-4x-linux.dtb
+
+# 打开 dtb 时指定解析方式：dts（同名 DTS 源文件，默认）或 dtb（二进制）
+python gui.py rk3588-nvr-demo-v10-ipc-4x-linux.dtb
+python gui.py rk3588-nvr-demo-v10-ipc-4x-linux.dtb --dtb-mode=dtb
 ```
 
 只依赖 Python 标准库（`tkinter`），无需安装第三方包。
@@ -34,6 +38,13 @@ python gui.py rk3588-nvr-demo-v10-ipc-4x-linux.dtb
 - **打开设备树**：支持 `.dts` / `.dtsi` / `.dtb`。
   - DTS 会递归解析 `#include` 链；
   - DTB 直接读取二进制 FDT，通过 phandle 精确解析 `pinctrl-N`，不依赖 `dtc`。
+- **DTB 解析方式可选**（工具栏「DTB 解析方式」，仅对 `.dtb` 生效，**默认同名 DTS 解析**）：
+  - **同名 DTS 解析**（默认）：改为查找同目录下的同名 `.dts` 源文件并按 DTS 文本解析，
+    能看到 include 链和文件行号，便于改源码时定位；找不到同名 DTS 时会提示，
+    可选择回退到二进制解析；
+  - **DTB 二进制解析**：直接解析编译产物，反映最终生效状态，没有文件行号。
+  - 切换解析方式时，如果当前打开的是 `.dtb`，会立即用新方式重新解析；
+    徽标显示 `DTB` / `DTB→DTS` / `DTS` 以标明本次结果来自哪种解析逻辑。
 - **冲突列表**：按 GPIO pin 汇总冲突，左侧列表显示引脚、节点数、占用节点；点击一行可在右侧查看：
   - 每个节点通过哪个 `pinctrl-N` 组或 `*-gpios` 属性占用；
   - 复用功能号 `func`、上下拉 `bias`；

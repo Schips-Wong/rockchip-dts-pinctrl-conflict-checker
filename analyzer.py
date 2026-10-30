@@ -7,6 +7,10 @@
 - .dtb：用 dtb_parser.py 读取编译后的最终设备树，按 phandle 精确解析
   pinctrl-N 引用和 *-gpios 属性。
 
+对于 .dtb，还可以选择「同名 DTS」解析方式：不做二进制解析，改为查找
+同目录下的同名 .dts 源文件并按 DTS 文本解析，便于在只有编译产物时仍能
+看到文件行号。
+
 两种输入最终都转换成统一的 PinClaim / AnalysisResult，供 GUI 显示和查询。
 """
 
@@ -33,7 +37,28 @@ from model import (
 # 通用
 # ============================================================
 
-def _is_dtb(path: str) -> bool:
+# DTB 的两种解析方式：
+#   DTB_SOURCE_BINARY —— 直接解析 .dtb 二进制（编译后的最终状态）；
+#   DTB_SOURCE_DTS    —— 改用同目录下的同名 .dts 源文件解析（有行号，可读性好）。
+DTB_SOURCE_BINARY = "dtb"
+DTB_SOURCE_DTS = "dts"
+
+
+class SiblingDtsMissing(FileNotFoundError):
+    """选择了「同名 DTS」解析方式，但找不到同名 .dts 文件。"""
+
+    def __init__(self, dtb_path: str, searched: List[str]):
+        self.dtb_path = dtb_path
+        self.searched = list(searched)
+        detail = "\n".join(f"  - {p}" for p in self.searched)
+        super().__init__(
+            f"未找到与 {os.path.basename(dtb_path)} 同名的 DTS 源文件。\n"
+            f"已查找：\n{detail}"
+        )
+
+
+def is_dtb_file(path: str) -> bool:
+    """按扩展名或 FDT magic 判断是否为 DTB。"""
     if path.lower().endswith(".dtb"):
         return True
     try:
@@ -41,6 +66,32 @@ def _is_dtb(path: str) -> bool:
             return f.read(4) == struct.pack(">I", FDT_MAGIC)
     except OSError:
         return False
+
+
+def _is_dtb(path: str) -> bool:
+    return is_dtb_file(path)
+
+
+def find_sibling_dts(dtb_path: str) -> Optional[str]:
+    """查找与 DTB 同名的 .dts（同目录、同主文件名，大小写不敏感兜底）。"""
+    base = os.path.splitext(os.path.abspath(dtb_path))[0]
+    candidate = base + ".dts"
+    if os.path.isfile(candidate):
+        return candidate
+
+    directory = os.path.dirname(base)
+    target = os.path.basename(candidate).lower()
+    try:
+        names = sorted(os.listdir(directory))
+    except OSError:
+        return None
+    for name in names:
+        if name.lower() != target:
+            continue
+        full = os.path.join(directory, name)
+        if os.path.isfile(full):
+            return full
+    return None
 
 
 def _add_warning(bucket: List[str], seen: Set[str], message: str) -> None:
@@ -60,12 +111,19 @@ def _effective_status(node_path: str, status_map: Dict[str, str]) -> str:
     return status_map.get(node_path, "okay")
 
 
-def analyze(path: str) -> AnalysisResult:
-    """解析 dts 或 dtb，返回统一的结果对象。"""
+def analyze(path: str, dtb_source: str = DTB_SOURCE_BINARY) -> AnalysisResult:
+    """解析 dts 或 dtb，返回统一的结果对象。
+
+    dtb_source 只对 .dtb 生效：
+      DTB_SOURCE_BINARY —— 直接解析 .dtb 二进制；
+      DTB_SOURCE_DTS    —— 改用同名 .dts 源文件解析。
+    """
     path = os.path.abspath(path)
     if not os.path.isfile(path):
         raise FileNotFoundError(f"文件不存在：{path}")
     if _is_dtb(path):
+        if dtb_source == DTB_SOURCE_DTS:
+            return analyze_dtb_via_dts(path)
         return analyze_dtb(path)
     return analyze_dts(path)
 
@@ -403,4 +461,27 @@ def analyze_dtb(path: str) -> AnalysisResult:
     analyzer = _DtbAnalyzer(tree)
     result = analyzer.run()
     result.parse_seconds = time.perf_counter() - t0
+    return result
+
+
+def analyze_dtb_via_dts(path: str) -> AnalysisResult:
+    """选择「同名 DTS」方式时：用同目录同名 .dts 源文件代替 DTB 做文本解析。"""
+    dtb_path = os.path.abspath(path)
+    dts_path = find_sibling_dts(dtb_path)
+    if dts_path is None:
+        raise SiblingDtsMissing(
+            dtb_path,
+            [os.path.splitext(dtb_path)[0] + ".dts"],
+        )
+
+    result = analyze_dts(dts_path)
+    # kind 单独标记，便于界面提示“这是 DTB 但按同名 DTS 解析”；
+    # entry 仍保留用户打开的 .dtb，报告文件名与之对应。
+    result.kind = "dtb_dts"
+    result.entry = dtb_path
+    result.base_dir = os.path.dirname(dtb_path)
+    result.warnings.insert(
+        0,
+        f"解析方式：使用同名 DTS 源文件代替 DTB 解析 —— {dts_path}",
+    )
     return result
